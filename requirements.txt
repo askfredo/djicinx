@@ -1,7 +1,7 @@
-numpy==1.26.4
-pandas==2.2.2
+numpy==2.1.3
+pandas==2.2.3
 yfinance==0.2.54
-lightgbm==4.3.0
-scikit-learn==1.4.2
+lightgbm==4.5.0
+scikit-learn==1.5.2
 requests==2.32.3
 pytz==2024.1
