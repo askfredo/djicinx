@@ -1,6 +1,5 @@
-# CINAX DJ v3 — Producción Diaria (Railway)
-# Envía señales a Discord via webhook
-# Basado en el backtest validado con modelo .pkl del Dow Jones (^DJI)
+# CINAX DJ v3 — Producción Diaria (Cloud Run)
+# Igual que antes + servidor HTTP para health check de Cloud Run
 
 import numpy as np
 import pandas as pd
@@ -10,12 +9,33 @@ import os
 import time
 import warnings
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 import pytz
 warnings.filterwarnings("ignore")
 
 # ══════════════════════════════════════════════════════════════
-# CONFIGURACIÓN  (variables de entorno en Railway)
+# HEALTH CHECK SERVER — necesario para Cloud Run
+# ══════════════════════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # silenciar logs del servidor http
+
+def iniciar_servidor_health():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[Health] Servidor HTTP en puerto {port}", flush=True)
+
+# ══════════════════════════════════════════════════════════════
+# CONFIGURACIÓN  (variables de entorno en Cloud Run)
 # ══════════════════════════════════════════════════════════════
 
 RUTA_PKL        = os.environ.get("RUTA_PKL", "modelo.pkl")
@@ -30,7 +50,7 @@ ACTIVO       = "^DJI"
 WINDOW_PCT   = 252
 MERCADO_TZ   = pytz.timezone("America/New_York")
 CHECK_MINS   = 60
-DIAS_ENTRADA = {0, 1, 2}          # 0=Lun, 1=Mar, 2=Mié
+DIAS_ENTRADA = {0, 1, 2}
 NOMBRES_DIA  = {0:"Lunes", 1:"Martes", 2:"Miércoles", 3:"Jueves", 4:"Viernes"}
 
 MACRO_TICKERS = [
@@ -44,7 +64,6 @@ MACRO_TICKERS = [
     "QQQ",      "IWM",   "EEM",   "UUP",
 ]
 
-# Features top-20 DJ v3 — deben coincidir exactamente con el entrenamiento
 COLS_FIN = [
     "bb_squeeze_pct",
     "sma50_vs_200_pct",
@@ -269,7 +288,7 @@ def descargar_datos():
     return df_raw
 
 # ══════════════════════════════════════════════════════════════
-# FEATURES — IDÉNTICAS AL SCRIPT DE ENTRENAMIENTO (DJ v3)
+# FEATURES
 # ══════════════════════════════════════════════════════════════
 
 def P(series, w=WINDOW_PCT):
@@ -432,10 +451,6 @@ def predecir(modelo, df_feat):
 
 
 def calcular_umbral_rolling(modelo, df_feat):
-    """
-    Umbral rolling p{PCTIL} sin look-ahead (expanding + shift 1),
-    idéntico al backtest de validación.
-    """
     X_hist  = df_feat[COLS_FIN].fillna(0.5).values
     probs_h = modelo.predict_proba(X_hist)[:, 1]
     s       = pd.Series(probs_h, index=df_feat.index)
@@ -587,8 +602,11 @@ def resumen_log():
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    # ← ÚNICA LÍNEA NUEVA: arrancar el servidor HTTP antes de todo
+    iniciar_servidor_health()
+
     log("=" * 60)
-    log("CINAX DJ v3 — Producción Diaria (Railway)")
+    log("CINAX DJ v3 — Producción Diaria (Cloud Run)")
     log(f"Activo  : Dow Jones (^DJI)")
     log(f"Config  : percentil={PCTIL} | entrada=Lun/Mar/Mié | exit=viernes CLOSE")
     log(f"Modelo  : {RUTA_PKL}")
@@ -604,7 +622,7 @@ def main():
     with open(RUTA_PKL, "rb") as f:
         modelo = pickle.load(f)
     log(f"Modelo cargado ✓", "OK")
-    discord(f"🚀 **CINAX DJ v3** arrancado correctamente en Railway | p{PCTIL} | ^DJI")
+    discord(f"🚀 **CINAX DJ v3** arrancado correctamente en Cloud Run | p{PCTIL} | ^DJI")
 
     ultima_fecha_evaluada = None
 
@@ -613,21 +631,18 @@ def main():
             ahora_et   = datetime.now(MERCADO_TZ)
             dia_semana = ahora_et.weekday()
 
-            # Fin de semana — dormir hasta el lunes
             if dia_semana >= 5:
                 secs = segundos_hasta_cierre()
                 log(f"Fin de semana. Próxima evaluación en {secs/3600:.1f}h", "WARN")
                 time.sleep(secs + 60)
                 continue
 
-            # Mercado aún abierto — esperar cierre
             if not mercado_cerrado_hoy():
                 secs = segundos_hasta_cierre()
                 log(f"Esperando cierre del mercado en {secs/60:.0f} min...")
                 time.sleep(min(secs, CHECK_MINS * 60))
                 continue
 
-            # ── Descargar y construir features ──────────────────────────
             log("Descargando datos y calculando features...")
             df_raw  = descargar_datos()
             df_feat = build_features(df_raw)
@@ -640,20 +655,16 @@ def main():
             prob, fecha_barra, precio = predecir(modelo, df_feat)
             umbral = calcular_umbral_rolling(modelo, df_feat)
 
-            # Registrar OHLC intra para posiciones abiertas
             registrar_barra_intra(df_raw, fecha_barra)
 
-            # Barra ya evaluada hoy → esperar mañana
             if fecha_barra == ultima_fecha_evaluada:
                 secs = segundos_hasta_cierre()
                 log(f"Barra {fecha_barra.date()} ya evaluada. Próxima en {secs/3600:.1f}h")
                 time.sleep(CHECK_MINS * 60)
                 continue
 
-            # Cerrar posiciones cuyo viernes de exit ya llegó
             cerradas_hoy = cerrar_posiciones_vencidas(df_feat, df_raw)
 
-            # ── Lun / Mar / Mié: evaluar señal ──────────────────────────
             if dia_semana in DIAS_ENTRADA:
                 señal = prob >= umbral
                 info  = (f"{fecha_barra.date()} ({NOMBRES_DIA.get(dia_semana, '')}) | "
@@ -673,7 +684,6 @@ def main():
                     cerradas_hoy if len(cerradas_hoy) > 0 else None
                 )
 
-            # ── Jueves: seguimiento ──────────────────────────────────────
             elif dia_semana == 3:
                 resumen_log()
                 discord_seguimiento_posicion(
@@ -681,7 +691,6 @@ def main():
                     cerradas_hoy if len(cerradas_hoy) > 0 else None
                 )
 
-            # ── Viernes: cerrar vencidas + resumen ──────────────────────
             elif dia_semana == 4:
                 resumen_log()
                 if len(cerradas_hoy) > 0:
